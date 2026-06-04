@@ -55,9 +55,21 @@ bool hmacSha256Hex(const char* secret, const char* text, char* out,
 bool ensureWifi(uint32_t timeoutMs = 20000) {
   if (WiFi.status() == WL_CONNECTED) return true;
 
+  if (strcmp(WIFI_SSID, "your-wifi-ssid") == 0) {
+    Serial.println("wifi: configure include/secrets.h before connecting");
+    return false;
+  }
+
   Serial.printf("wifi: connecting to %s\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.disconnect(false, false, 1000);
+  delay(100);
+
+  const wl_status_t beginStatus = WiFi.begin(WIFI_SSID, WIFI_PASS);
+  if (beginStatus == WL_CONNECT_FAILED) {
+    Serial.println("wifi: begin failed");
+    return false;
+  }
 
   const uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
@@ -68,6 +80,7 @@ bool ensureWifi(uint32_t timeoutMs = 20000) {
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("wifi: connect failed");
+    WiFi.disconnect(false, false, 1000);
     return false;
   }
 
