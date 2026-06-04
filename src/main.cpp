@@ -2,18 +2,32 @@
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <cstdint>
 #include <cstring>
+#include <time.h>
 
 #include "CloudConfig.h"
-#include "RootCa.h"
 #include "secrets.h"
 
 #include "mbedtls/md.h"
+
+extern "C" {
+extern const uint8_t x509_crt_bundle_start[] asm("_binary_x509_crt_bundle_start");
+extern const uint8_t x509_crt_bundle_end[] asm("_binary_x509_crt_bundle_end");
+}
 
 namespace {
 
 char lineBuf[96];
 size_t lineLen = 0;
+
+static constexpr uint32_t kWifiConnectTimeoutMs = 20000;
+static constexpr uint32_t kTimeSyncTimeoutMs = 15000;
+static constexpr uint32_t kHttpTimeoutMs = 15000;
+static constexpr time_t kMinValidUnixTime = 1735689600;  // 2025-01-01T00:00:00Z
+static constexpr const char* kNtpServer1 = "pool.ntp.org";
+static constexpr const char* kNtpServer2 = "time.cloudflare.com";
+static constexpr const char* kNtpServer3 = "time.nist.gov";
 
 void bytesToHex(const unsigned char* in, size_t len, char* out, size_t outCap) {
   static constexpr char kHex[] = "0123456789abcdef";
@@ -52,7 +66,7 @@ bool hmacSha256Hex(const char* secret, const char* text, char* out,
   return out[0] != '\0';
 }
 
-bool ensureWifi(uint32_t timeoutMs = 20000) {
+bool ensureWifi(uint32_t timeoutMs = kWifiConnectTimeoutMs) {
   if (WiFi.status() == WL_CONNECTED) return true;
 
   if (strcmp(WIFI_SSID, "your-wifi-ssid") == 0) {
@@ -89,16 +103,80 @@ bool ensureWifi(uint32_t timeoutMs = 20000) {
   return true;
 }
 
+bool timeLooksValid() {
+  return time(nullptr) >= kMinValidUnixTime;
+}
+
+void printUtcTime(const char* prefix) {
+  const time_t now = time(nullptr);
+  if (now < kMinValidUnixTime) {
+    Serial.print(prefix);
+    Serial.println("not set");
+    return;
+  }
+
+  struct tm tmUtc;
+  gmtime_r(&now, &tmUtc);
+  char text[32];
+  strftime(text, sizeof(text), "%Y-%m-%dT%H:%M:%SZ", &tmUtc);
+  Serial.print(prefix);
+  Serial.println(text);
+}
+
+bool ensureTime(uint32_t timeoutMs = kTimeSyncTimeoutMs) {
+  if (timeLooksValid()) return true;
+
+  Serial.println("time: syncing SNTP");
+  configTime(0, 0, kNtpServer1, kNtpServer2, kNtpServer3);
+
+  const uint32_t start = millis();
+  while (!timeLooksValid() && millis() - start < timeoutMs) {
+    delay(250);
+    Serial.print('.');
+  }
+  Serial.println();
+
+  if (!timeLooksValid()) {
+    Serial.println("time: sync failed");
+    return false;
+  }
+
+  printUtcTime("time: synced utc=");
+  return true;
+}
+
+size_t caBundleSize() {
+  const uintptr_t start =
+      reinterpret_cast<uintptr_t>(x509_crt_bundle_start);
+  const uintptr_t end = reinterpret_cast<uintptr_t>(x509_crt_bundle_end);
+  if (end <= start) return 0;
+  return static_cast<size_t>(end - start);
+}
+
+bool configureTlsClient(WiFiClientSecure& client) {
+  const size_t bundleSize = caBundleSize();
+  if (bundleSize == 0) {
+    Serial.println("tls: CA bundle is empty");
+    return false;
+  }
+
+  client.setCACertBundle(x509_crt_bundle_start, bundleSize);
+  client.setTimeout(kHttpTimeoutMs);
+  Serial.printf("tls: using ESP-IDF CA bundle bytes=%u\n",
+                static_cast<unsigned>(bundleSize));
+  return true;
+}
+
 int httpsRequest(const char* method, const char* url, const char* body,
                  String* responseOut) {
   if (!ensureWifi()) return -1;
+  if (!ensureTime()) return -1;
 
   WiFiClientSecure client;
-  client.setCACert(CLOUDFLARE_ROOT_CA_PEM);
-  client.setTimeout(15000);
+  if (!configureTlsClient(client)) return -1;
 
   HTTPClient http;
-  http.setTimeout(15000);
+  http.setTimeout(kHttpTimeoutMs);
   if (!http.begin(client, url)) {
     Serial.println("http: begin failed");
     return -1;
@@ -123,6 +201,7 @@ void printHelp() {
   Serial.println("commands:");
   Serial.println("  help");
   Serial.println("  wifi");
+  Serial.println("  time");
   Serial.println("  health");
   Serial.println("  vector");
   Serial.println("  sample");
@@ -136,6 +215,17 @@ void commandWifi() {
   Serial.print(WiFi.localIP());
   Serial.print(" rssi=");
   Serial.println(WiFi.RSSI());
+}
+
+void commandTime() {
+  if (timeLooksValid()) {
+    printUtcTime("time: utc=");
+    return;
+  }
+
+  if (!ensureWifi()) return;
+  if (!ensureTime()) return;
+  printUtcTime("time: utc=");
 }
 
 void commandHealth() {
@@ -237,6 +327,8 @@ void dispatch(char* line) {
     printHelp();
   } else if (strcmp(line, "wifi") == 0) {
     commandWifi();
+  } else if (strcmp(line, "time") == 0) {
+    commandTime();
   } else if (strcmp(line, "health") == 0) {
     commandHealth();
   } else if (strcmp(line, "vector") == 0) {

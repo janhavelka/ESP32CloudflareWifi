@@ -24,6 +24,7 @@ This intentionally does not include sensors, SD logging, GSM, display, RS485, ba
 
    ```text
    wifi
+   time
    health
    vector
    sample
@@ -38,6 +39,10 @@ s=b4fd8c0a886b09137f25534078bdc8fc5abef4f159076d7fe7b30f71e217fe9b
 ```
 
 Repeated uploads of the fixed sample may return `duplicate`; that is valid.
+
+HTTPS uses the ESP-IDF x509 certificate bundle through Arduino
+`WiFiClientSecure::setCACertBundle(...)`. The device must sync UTC time with
+SNTP before TLS certificate validation can succeed.
 
 ## Cloudflare Worker
 
