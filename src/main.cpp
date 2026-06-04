@@ -2,13 +2,13 @@
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <cstring>
 
 #include "CloudConfig.h"
 #include "RootCa.h"
 #include "secrets.h"
 
 #include "mbedtls/md.h"
-#include "mbedtls/sha256.h"
 
 namespace {
 
@@ -29,9 +29,11 @@ void bytesToHex(const unsigned char* in, size_t len, char* out, size_t outCap) {
 }
 
 bool sha256Hex(const char* text, char* out, size_t outCap) {
+  const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (info == nullptr) return false;
   unsigned char digest[32];
-  const int rc = mbedtls_sha256_ret(
-      reinterpret_cast<const unsigned char*>(text), strlen(text), digest, 0);
+  const int rc = mbedtls_md(
+      info, reinterpret_cast<const unsigned char*>(text), strlen(text), digest);
   if (rc != 0) return false;
   bytesToHex(digest, sizeof(digest), out, outCap);
   return out[0] != '\0';
@@ -94,7 +96,7 @@ int httpsRequest(const char* method, const char* url, const char* body,
     code = http.GET();
   } else {
     http.addHeader("Content-Type", "application/json");
-    code = http.POST(reinterpret_cast<const uint8_t*>(body), strlen(body));
+    code = http.POST(String(body));
   }
 
   if (responseOut != nullptr) {
