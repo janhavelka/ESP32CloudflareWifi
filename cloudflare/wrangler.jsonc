@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tm-dev-ingest",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-04",
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "tm-dev-ingest-db",
+      "database_id": "<fill after: wrangler d1 create tm-dev-ingest-db>"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "RAW_BUCKET",
+      "bucket_name": "tm-dev-ingest-raw"
+    }
+  ]
+}

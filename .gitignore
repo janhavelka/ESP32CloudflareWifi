@@ -1,0 +1,7 @@
+.pio/
+.vscode/
+include/secrets.h
+
+cloudflare/node_modules/
+cloudflare/.wrangler/
+cloudflare/dist/
