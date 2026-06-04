@@ -25,6 +25,7 @@ This intentionally does not include sensors, SD logging, GSM, display, RS485, ba
    ```text
    wifi
    time
+   status
    health
    vector
    sample
@@ -43,6 +44,11 @@ Repeated uploads of the fixed sample may return `duplicate`; that is valid.
 HTTPS uses the ESP-IDF x509 certificate bundle through Arduino
 `WiFiClientSecure::setCACertBundle(...)`. The device must sync UTC time with
 SNTP before TLS certificate validation can succeed.
+
+Use `status` or `conn` to check real cloud connectivity. It reports the WiFi
+association, IP/DNS/gateway details, SNTP clock state, DNS resolution for the
+Cloudflare Worker host, and an HTTPS `/health` probe. This catches cases where
+the ESP32 is connected to a WiFi router but the router's GSM/LTE uplink is down.
 
 ## Cloudflare Worker
 

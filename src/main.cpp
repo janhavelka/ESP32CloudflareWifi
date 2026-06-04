@@ -66,6 +66,27 @@ bool hmacSha256Hex(const char* secret, const char* text, char* out,
   return out[0] != '\0';
 }
 
+const char* wifiStatusName(wl_status_t status) {
+  switch (status) {
+    case WL_IDLE_STATUS:
+      return "idle";
+    case WL_NO_SSID_AVAIL:
+      return "ssid_not_found";
+    case WL_SCAN_COMPLETED:
+      return "scan_completed";
+    case WL_CONNECTED:
+      return "connected";
+    case WL_CONNECT_FAILED:
+      return "connect_failed";
+    case WL_CONNECTION_LOST:
+      return "connection_lost";
+    case WL_DISCONNECTED:
+      return "disconnected";
+    default:
+      return "unknown";
+  }
+}
+
 bool ensureWifi(uint32_t timeoutMs = kWifiConnectTimeoutMs) {
   if (WiFi.status() == WL_CONNECTED) return true;
 
@@ -101,6 +122,37 @@ bool ensureWifi(uint32_t timeoutMs = kWifiConnectTimeoutMs) {
   Serial.print("wifi: connected ip=");
   Serial.println(WiFi.localIP());
   return true;
+}
+
+void printWifiDetails() {
+  const wl_status_t status = WiFi.status();
+  Serial.print("wifi: state=");
+  Serial.println(wifiStatusName(status));
+
+  if (status != WL_CONNECTED) {
+    return;
+  }
+
+  Serial.print("wifi: ssid=");
+  Serial.print(WIFI_SSID);
+  Serial.print(" bssid=");
+  Serial.print(WiFi.BSSIDstr());
+  Serial.print(" channel=");
+  Serial.print(WiFi.channel());
+  Serial.print(" rssi=");
+  Serial.println(WiFi.RSSI());
+
+  Serial.print("wifi: ip=");
+  Serial.print(WiFi.localIP());
+  Serial.print(" subnet=");
+  Serial.print(WiFi.subnetMask());
+  Serial.print(" gateway=");
+  Serial.println(WiFi.gatewayIP());
+
+  Serial.print("wifi: dns1=");
+  Serial.print(WiFi.dnsIP(0));
+  Serial.print(" dns2=");
+  Serial.println(WiFi.dnsIP(1));
 }
 
 bool timeLooksValid() {
@@ -167,6 +219,31 @@ bool configureTlsClient(WiFiClientSecure& client) {
   return true;
 }
 
+String compactResponse(String response) {
+  response.replace("\r", "");
+  response.replace("\n", " ");
+  response.trim();
+  if (response.length() > 180) {
+    response = response.substring(0, 180) + "...";
+  }
+  return response;
+}
+
+bool resolveCloudHost(IPAddress& addressOut) {
+  Serial.print("dns: resolving ");
+  Serial.println(CLOUD_HOST);
+
+  const int rc = WiFi.hostByName(CLOUD_HOST, addressOut);
+  if (rc != 1) {
+    Serial.printf("dns: failed rc=%d\n", rc);
+    return false;
+  }
+
+  Serial.print("dns: resolved ip=");
+  Serial.println(addressOut);
+  return true;
+}
+
 int httpsRequest(const char* method, const char* url, const char* body,
                  String* responseOut) {
   if (!ensureWifi()) return -1;
@@ -202,6 +279,8 @@ void printHelp() {
   Serial.println("  help");
   Serial.println("  wifi");
   Serial.println("  time");
+  Serial.println("  status");
+  Serial.println("  conn");
   Serial.println("  health");
   Serial.println("  vector");
   Serial.println("  sample");
@@ -209,12 +288,7 @@ void printHelp() {
 
 void commandWifi() {
   if (!ensureWifi()) return;
-  Serial.print("wifi: ssid=");
-  Serial.print(WIFI_SSID);
-  Serial.print(" ip=");
-  Serial.print(WiFi.localIP());
-  Serial.print(" rssi=");
-  Serial.println(WiFi.RSSI());
+  printWifiDetails();
 }
 
 void commandTime() {
@@ -233,6 +307,50 @@ void commandHealth() {
   const int code = httpsRequest("GET", CLOUD_HEALTH_URL, nullptr, &response);
   Serial.printf("health: http=%d\n", code);
   Serial.println(response);
+}
+
+void commandStatus() {
+  Serial.println("status: checking real cloud connectivity");
+
+  const bool wifiOk = ensureWifi();
+  printWifiDetails();
+  if (!wifiOk) {
+    Serial.println("status: OFFLINE reason=wifi_not_connected");
+    return;
+  }
+
+  IPAddress cloudIp;
+  const bool dnsOk = resolveCloudHost(cloudIp);
+
+  const bool timeOk = ensureTime();
+  if (timeOk) {
+    printUtcTime("time: utc=");
+  }
+
+  if (!dnsOk) {
+    Serial.println("status: OFFLINE reason=dns_or_wan_unreachable");
+    return;
+  }
+
+  if (!timeOk) {
+    Serial.println("status: OFFLINE reason=time_sync_failed");
+    return;
+  }
+
+  String response;
+  const int code = httpsRequest("GET", CLOUD_HEALTH_URL, nullptr, &response);
+  const bool cloudOk = code >= 200 && code < 300;
+  Serial.printf("cloud: health http=%d\n", code);
+  if (response.length() > 0) {
+    Serial.print("cloud: body=");
+    Serial.println(compactResponse(response));
+  }
+
+  if (cloudOk) {
+    Serial.println("status: ONLINE cloud_reachable=yes");
+  } else {
+    Serial.println("status: OFFLINE reason=cloud_health_failed");
+  }
 }
 
 bool buildSample(char* body, size_t bodyCap, char* hashOut, size_t hashCap,
@@ -329,6 +447,8 @@ void dispatch(char* line) {
     commandWifi();
   } else if (strcmp(line, "time") == 0) {
     commandTime();
+  } else if (strcmp(line, "status") == 0 || strcmp(line, "conn") == 0) {
+    commandStatus();
   } else if (strcmp(line, "health") == 0) {
     commandHealth();
   } else if (strcmp(line, "vector") == 0) {

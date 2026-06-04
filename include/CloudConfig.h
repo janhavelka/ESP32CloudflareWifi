@@ -4,6 +4,7 @@ static constexpr const char* CLOUD_HEALTH_URL =
     "https://tm-dev-ingest.jnhavelka.workers.dev/health";
 static constexpr const char* CLOUD_INGEST_URL =
     "https://tm-dev-ingest.jnhavelka.workers.dev/v1/ingest";
+static constexpr const char* CLOUD_HOST = "tm-dev-ingest.jnhavelka.workers.dev";
 
 static constexpr const char* CLOUD_DEVICE_ID = "tm-dev-001";
 static constexpr const char* CLOUD_HMAC_SECRET =
