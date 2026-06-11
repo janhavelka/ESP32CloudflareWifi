@@ -87,6 +87,28 @@ curl -i \
   --data '{"schema":"tm.sample.v1","device_id":"tm-dev-001","sample_id":"tm-dev-001-manual-test-000001","seq":1,"ts":"2026-06-04T06:30:00Z","channel":"cloud.test","value":1,"unit":"bool","quality":"ok","auth":{"t":"2026-06-04T06:30:00Z","n":"tm-dev-001-manual-test-000001","h":"42eccaf49e970e85163ffebf92b4f28b28e838ae533323406c16465e5918564f","s":"b4fd8c0a886b09137f25534078bdc8fc5abef4f159076d7fe7b30f71e217fe9b"}}'
 ```
 
+Repeatable PowerShell upload tests:
+
+```powershell
+cd cloudflare
+
+# Current PoC endpoint: signed tm.sample.v1, one new upload, one duplicate retry,
+# and one intentionally invalid missing-field request.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Send-IngestTests.ps1 `
+  -Mode Sample -Seq 900101 -New 1 -Dupes 1 -InvalidMissingField
+```
+
+The same helper can generate the fuller `tm.batch.v1` payload for the batch
+ingest endpoint, but that endpoint needs a registered device and token:
+
+```powershell
+cd cloudflare
+$env:TM_DEVICE_TOKEN = "<device token>"
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Send-IngestTests.ps1 `
+  -Mode Batch -DeviceId "tm-001" -Seq 1234 -New 2 -Dupes 1 -Conflict -InvalidMissingField
+```
+
 Check remote D1:
 
 ```bash
