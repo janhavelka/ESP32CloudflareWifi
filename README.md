@@ -1,8 +1,8 @@
-# ESP32-S3 WiFi Cloudflare Ingest PoC
+# ESP32-S3 WiFi Cloudflare Batch Ingest PoC
 
-Small proof repository for an ESP32-S3-WROOM-N16R8 using Arduino, WiFi station mode, and a USB serial CLI to POST one HMAC-signed sample to a Cloudflare Worker.
+Small proof repository for an ESP32-S3-WROOM-N16R8 using Arduino, WiFi station mode, and a USB serial CLI to POST a token-authenticated `tm.batch.v1` payload to a Cloudflare Worker.
 
-This intentionally does not include sensors, SD logging, GSM, display, RS485, batching, or replay logic.
+This intentionally does not include real sensors, SD logging, GSM, display, RS485, or replay logic. The payload uses fixed test measurements and current device time.
 
 ## Firmware
 
@@ -27,19 +27,13 @@ This intentionally does not include sensors, SD logging, GSM, display, RS485, ba
    time
    status
    health
-   vector
-   sample
-   sample
+   ready
+   payload
+   batch
+   batch
    ```
 
-Expected `vector` output:
-
-```text
-h=42eccaf49e970e85163ffebf92b4f28b28e838ae533323406c16465e5918564f
-s=b4fd8c0a886b09137f25534078bdc8fc5abef4f159076d7fe7b30f71e217fe9b
-```
-
-Repeated uploads of the fixed sample may return `duplicate`; that is valid.
+`payload` prints the JSON that will be sent. `batch` sends it to the Worker with `X-TM-Device` and `X-TM-Token` headers.
 
 HTTPS uses the ESP-IDF x509 certificate bundle through Arduino
 `WiFiClientSecure::setCACertBundle(...)`. The device must sync UTC time with
@@ -55,68 +49,25 @@ the ESP32 is connected to a WiFi router but the router's GSM/LTE uplink is down.
 The firmware targets:
 
 ```text
-https://tm-dev-ingest.jnhavelka.workers.dev/v1/ingest
+https://tunnel-monitor.jnhavelka.workers.dev/api/v1/ingest
 ```
 
-Deploying the Worker name `tm-dev-ingest` in the same Cloudflare account will update that existing workers.dev route.
+The attached bundled Worker in `docs/worker/worker.md` exposes `TunnelMonitor` version `0.6.0`, public health/readiness endpoints, `/api/v1/ingest`, `/admin`, and admin API routes under `/api/v1/admin/*`.
 
-Setup:
+The checked-in `cloudflare/src` folder still contains the earlier single-sample HMAC Worker. Use the attached batch Worker, or replace the local Worker source before deploying this newer protocol.
 
-```bash
-cd cloudflare
-npm install
-npx wrangler login
-npx wrangler d1 create tm-dev-ingest-db
-npx wrangler r2 bucket create tm-dev-ingest-raw
-```
-
-Paste the generated D1 `database_id` into `cloudflare/wrangler.jsonc`, then run:
-
-```bash
-npx wrangler d1 migrations apply DB --local
-npx wrangler d1 migrations apply DB --remote
-npm run deploy
-```
-
-PC POST test:
-
-```bash
-curl -i \
-  -X POST "https://tm-dev-ingest.jnhavelka.workers.dev/v1/ingest" \
-  -H "Content-Type: application/json" \
-  --data '{"schema":"tm.sample.v1","device_id":"tm-dev-001","sample_id":"tm-dev-001-manual-test-000001","seq":1,"ts":"2026-06-04T06:30:00Z","channel":"cloud.test","value":1,"unit":"bool","quality":"ok","auth":{"t":"2026-06-04T06:30:00Z","n":"tm-dev-001-manual-test-000001","h":"42eccaf49e970e85163ffebf92b4f28b28e838ae533323406c16465e5918564f","s":"b4fd8c0a886b09137f25534078bdc8fc5abef4f159076d7fe7b30f71e217fe9b"}}'
-```
-
-Repeatable PowerShell upload tests:
+Repeatable PowerShell upload tests from the PC:
 
 ```powershell
-cd cloudflare
-
-# Current PoC endpoint: signed tm.sample.v1, one new upload, one duplicate retry,
-# and one intentionally invalid missing-field request.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Send-IngestTests.ps1 `
-  -Mode Sample -Seq 900101 -New 1 -Dupes 1 -InvalidMissingField
-```
-
-The same helper can generate the fuller `tm.batch.v1` payload for the batch
-ingest endpoint, but that endpoint needs a registered device and token:
-
-```powershell
-cd cloudflare
 $env:TM_DEVICE_TOKEN = "<device token>"
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Send-IngestTests.ps1 `
-  -Mode Batch -DeviceId "tm-001" -Seq 1234 -New 2 -Dupes 1 -Conflict -InvalidMissingField
-```
-
-Check remote D1:
-
-```bash
-npx wrangler d1 execute DB --remote --command "SELECT device_id, sample_id, seq, r2_key, created_at FROM ingest_samples ORDER BY id DESC LIMIT 5"
-```
-
-Check remote R2:
-
-```bash
-npx wrangler r2 object get tm-dev-ingest-raw/raw/tm-dev-001/tm-dev-001-manual-test-000001.json --remote
+.\cloudflare\scripts\Send-IngestTests.ps1 `
+  -Mode Batch `
+  -BaseUrl "https://tunnel-monitor.jnhavelka.workers.dev" `
+  -DeviceId "tm-test-mcu-1" `
+  -Seq 1234 `
+  -New 1 `
+  -Dupes 1 `
+  -Conflict `
+  -InvalidMissingField
 ```

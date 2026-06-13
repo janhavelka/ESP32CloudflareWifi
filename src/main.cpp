@@ -9,8 +9,6 @@
 #include "CloudConfig.h"
 #include "secrets.h"
 
-#include "mbedtls/md.h"
-
 extern "C" {
 extern const uint8_t x509_crt_bundle_start[] asm("_binary_x509_crt_bundle_start");
 extern const uint8_t x509_crt_bundle_end[] asm("_binary_x509_crt_bundle_end");
@@ -28,43 +26,11 @@ static constexpr time_t kMinValidUnixTime = 1735689600;  // 2025-01-01T00:00:00Z
 static constexpr const char* kNtpServer1 = "pool.ntp.org";
 static constexpr const char* kNtpServer2 = "time.cloudflare.com";
 static constexpr const char* kNtpServer3 = "time.nist.gov";
-
-void bytesToHex(const unsigned char* in, size_t len, char* out, size_t outCap) {
-  static constexpr char kHex[] = "0123456789abcdef";
-  if (outCap < (len * 2U + 1U)) {
-    if (outCap > 0) out[0] = '\0';
-    return;
-  }
-  for (size_t i = 0; i < len; ++i) {
-    out[i * 2U] = kHex[(in[i] >> 4) & 0x0F];
-    out[i * 2U + 1U] = kHex[in[i] & 0x0F];
-  }
-  out[len * 2U] = '\0';
-}
-
-bool sha256Hex(const char* text, char* out, size_t outCap) {
-  const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-  if (info == nullptr) return false;
-  unsigned char digest[32];
-  const int rc = mbedtls_md(
-      info, reinterpret_cast<const unsigned char*>(text), strlen(text), digest);
-  if (rc != 0) return false;
-  bytesToHex(digest, sizeof(digest), out, outCap);
-  return out[0] != '\0';
-}
-
-bool hmacSha256Hex(const char* secret, const char* text, char* out,
-                   size_t outCap) {
-  const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-  if (info == nullptr) return false;
-  unsigned char digest[32];
-  const int rc = mbedtls_md_hmac(
-      info, reinterpret_cast<const unsigned char*>(secret), strlen(secret),
-      reinterpret_cast<const unsigned char*>(text), strlen(text), digest);
-  if (rc != 0) return false;
-  bytesToHex(digest, sizeof(digest), out, outCap);
-  return out[0] != '\0';
-}
+static constexpr const char* kBatchSchema = "tm.batch.v1";
+static constexpr const char* kBatchProfile = "tm.v1.vw8_shzk16_env_power";
+static constexpr uint32_t kSamplePeriodSeconds = 900;
+static constexpr const char* kFirmwareVersion = "0.1.0";
+static constexpr const char* kHardwareVersion = "esp32-s3-wroom-n16r8";
 
 const char* wifiStatusName(wl_status_t status) {
   switch (status) {
@@ -245,7 +211,7 @@ bool resolveCloudHost(IPAddress& addressOut) {
 }
 
 int httpsRequest(const char* method, const char* url, const char* body,
-                 String* responseOut) {
+                 String* responseOut, bool includeDeviceAuth = false) {
   if (!ensureWifi()) return -1;
   if (!ensureTime()) return -1;
 
@@ -264,6 +230,16 @@ int httpsRequest(const char* method, const char* url, const char* body,
     code = http.GET();
   } else {
     http.addHeader("Content-Type", "application/json");
+    if (includeDeviceAuth) {
+      if (strcmp(CLOUD_DEVICE_TOKEN, "your-device-token") == 0 ||
+          strlen(CLOUD_DEVICE_TOKEN) == 0) {
+        Serial.println("cloud: configure CLOUD_DEVICE_TOKEN in include/secrets.h");
+        http.end();
+        return -1;
+      }
+      http.addHeader("X-TM-Device", CLOUD_DEVICE_ID);
+      http.addHeader("X-TM-Token", CLOUD_DEVICE_TOKEN);
+    }
     code = http.POST(String(body));
   }
 
@@ -282,8 +258,9 @@ void printHelp() {
   Serial.println("  status");
   Serial.println("  conn");
   Serial.println("  health");
-  Serial.println("  vector");
-  Serial.println("  sample");
+  Serial.println("  ready");
+  Serial.println("  payload");
+  Serial.println("  batch");
 }
 
 void commandWifi() {
@@ -306,6 +283,13 @@ void commandHealth() {
   String response;
   const int code = httpsRequest("GET", CLOUD_HEALTH_URL, nullptr, &response);
   Serial.printf("health: http=%d\n", code);
+  Serial.println(response);
+}
+
+void commandReadiness() {
+  String response;
+  const int code = httpsRequest("GET", CLOUD_READINESS_URL, nullptr, &response);
+  Serial.printf("ready: http=%d\n", code);
   Serial.println(response);
 }
 
@@ -353,87 +337,117 @@ void commandStatus() {
   }
 }
 
-bool buildSample(char* body, size_t bodyCap, char* hashOut, size_t hashCap,
-                 char* sigOut, size_t sigCap) {
-  static constexpr const char* kSchema = "tm.sample.v1";
-  static constexpr const char* kChannel = "cloud.test";
-  static constexpr const char* kUnit = "bool";
-  static constexpr const char* kQuality = "ok";
+long long nextSeqFirst() {
+  static long long lastSeqFirst = 0;
 
-  char canonical[384];
-  const int canonicalLen = snprintf(
-      canonical, sizeof(canonical), "%s\n%s\n%s\n1\n%s\n%s\n1\n%s\n%s\n%s\n%s",
-      kSchema, CLOUD_DEVICE_ID, CLOUD_SAMPLE_ID, CLOUD_TIMESTAMP, kChannel,
-      kUnit, kQuality, CLOUD_TIMESTAMP, CLOUD_NONCE);
-  if (canonicalLen <= 0 ||
-      static_cast<size_t>(canonicalLen) >= sizeof(canonical)) {
-    Serial.println("sample: canonical too long");
-    return false;
+  long long candidate = static_cast<long long>(time(nullptr));
+  if (candidate <= lastSeqFirst + 1) {
+    candidate = lastSeqFirst + 2;
   }
+  lastSeqFirst = candidate;
+  return candidate;
+}
 
-  if (!sha256Hex(canonical, hashOut, hashCap)) {
-    Serial.println("sample: sha256 failed");
-    return false;
-  }
-  if (!hmacSha256Hex(CLOUD_HMAC_SECRET, canonical, sigOut, sigCap)) {
-    Serial.println("sample: hmac failed");
+bool buildBatch(char* body, size_t bodyCap, char* batchId, size_t batchIdCap,
+                long long* seqLastOut) {
+  const long long seqFirst = nextSeqFirst();
+  const long long seqLast = seqFirst + 1;
+  const long long now = static_cast<long long>(time(nullptr));
+  const unsigned long uptimeSeconds = millis() / 1000UL;
+  const int rssi = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+
+  const int batchIdLen = snprintf(
+      batchId, batchIdCap, "%s-%lld-%lld", CLOUD_DEVICE_ID, seqFirst, seqLast);
+  if (batchIdLen <= 0 || static_cast<size_t>(batchIdLen) >= batchIdCap) {
+    Serial.println("batch: id too long");
     return false;
   }
 
   const int bodyLen = snprintf(
       body, bodyCap,
       "{\"schema\":\"%s\","
+      "\"profile\":\"%s\","
       "\"device_id\":\"%s\","
-      "\"sample_id\":\"%s\","
-      "\"seq\":1,"
-      "\"ts\":\"%s\","
-      "\"channel\":\"%s\","
-      "\"value\":1,"
-      "\"unit\":\"%s\","
-      "\"quality\":\"%s\","
-      "\"auth\":{\"t\":\"%s\",\"n\":\"%s\",\"h\":\"%s\",\"s\":\"%s\"}}",
-      kSchema, CLOUD_DEVICE_ID, CLOUD_SAMPLE_ID, CLOUD_TIMESTAMP, kChannel,
-      kUnit, kQuality, CLOUD_TIMESTAMP, CLOUD_NONCE, hashOut, sigOut);
+      "\"batch_id\":\"%s\","
+      "\"seq_first\":%lld,"
+      "\"seq_last\":%lld,"
+      "\"sample_period_s\":%u,"
+      "\"created_at\":%lld,"
+      "\"boot_id\":\"esp32s3-test\","
+      "\"fw\":\"%s\","
+      "\"hw\":\"%s\","
+      "\"samples\":["
+      "{\"seq\":%lld,\"t\":%lld,"
+      "\"vw_f\":[1240.52,1241.52,1242.52,1243.52,1244.52,1245.52,1246.52,1247.52],"
+      "\"vw_t\":[18.6,18.7,18.8,18.9,19,19.1,19.2,19.3],"
+      "\"shzk_t\":[21.2,21.4,21.6,21.8,22,22.2,22.4,22.6,22.8,23,23.2,23.4,23.6,23.8,24,24.2],"
+      "\"env\":{\"t_c\":20.8,\"rh_pct\":74.2,\"p_pa\":98420},"
+      "\"pwr\":{\"vin_v\":12.41,\"iin_a\":0.083}},"
+      "{\"seq\":%lld,\"t\":null,"
+      "\"vw_f\":[null,null,null,null,null,null,null,null],"
+      "\"vw_t\":[null,null,null,null,null,null,null,null],"
+      "\"shzk_t\":[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],"
+      "\"env\":{\"t_c\":null,\"rh_pct\":null,\"p_pa\":null},"
+      "\"pwr\":{\"vin_v\":null,\"iin_a\":null}}],"
+      "\"state\":{\"uptime_s\":%lu,\"system\":{\"ok\":true,\"status\":\"OK\"},"
+      "\"cloud\":{\"ok\":true,\"status\":\"OK\"}},"
+      "\"net\":{\"connected\":true,\"rssi\":%d},"
+      "\"queue\":{\"records\":2,\"unsent_samples\":2,"
+      "\"oldest_unsent_seq\":%lld,\"cursor_start\":0,\"cursor_end\":0,\"bytes\":0},"
+      "\"events\":[]}",
+      kBatchSchema, kBatchProfile, CLOUD_DEVICE_ID, batchId, seqFirst, seqLast,
+      static_cast<unsigned>(kSamplePeriodSeconds), now, kFirmwareVersion,
+      kHardwareVersion, seqFirst, now, seqLast, uptimeSeconds, rssi, seqFirst);
+
   if (bodyLen <= 0 || static_cast<size_t>(bodyLen) >= bodyCap) {
-    Serial.println("sample: JSON body too long");
+    Serial.println("batch: JSON body too long");
     return false;
+  }
+
+  if (seqLastOut != nullptr) {
+    *seqLastOut = seqLast;
   }
   return true;
 }
 
-void commandVector() {
-  char body[768];
-  char hash[65];
-  char sig[65];
-  if (!buildSample(body, sizeof(body), hash, sizeof(hash), sig, sizeof(sig))) {
+void commandPayload() {
+  if (!ensureWifi()) return;
+  if (!ensureTime()) return;
+
+  char body[3072];
+  char batchId[96];
+  long long seqLast = 0;
+  if (!buildBatch(body, sizeof(body), batchId, sizeof(batchId), &seqLast)) {
     return;
   }
-  Serial.print("h=");
-  Serial.println(hash);
-  Serial.print("s=");
-  Serial.println(sig);
+
+  Serial.print("batch_id=");
+  Serial.println(batchId);
+  Serial.printf("accepted_seq_last=%lld\n", seqLast);
   Serial.println(body);
 }
 
-void commandSample() {
-  char body[768];
-  char hash[65];
-  char sig[65];
-  if (!buildSample(body, sizeof(body), hash, sizeof(hash), sig, sizeof(sig))) {
+void commandBatch() {
+  if (!ensureWifi()) return;
+  if (!ensureTime()) return;
+
+  char body[3072];
+  char batchId[96];
+  long long seqLast = 0;
+  if (!buildBatch(body, sizeof(body), batchId, sizeof(batchId), &seqLast)) {
     return;
   }
 
   String response;
-  const int code = httpsRequest("POST", CLOUD_INGEST_URL, body, &response);
-  Serial.printf("sample: http=%d h=%s s=%s\n", code, hash, sig);
+  const int code = httpsRequest("POST", CLOUD_INGEST_URL, body, &response, true);
+  Serial.printf("batch: http=%d batch_id=%s accepted_seq_last=%lld\n", code,
+                batchId, seqLast);
   Serial.println(response);
-
   if (code >= 200 && code < 300 &&
-      (response.indexOf("\"accepted\"") >= 0 ||
-       response.indexOf("\"duplicate\"") >= 0)) {
-    Serial.println("sample: OK");
+      response.indexOf("\"status\":\"accepted\"") >= 0) {
+    Serial.println("batch: OK");
   } else {
-    Serial.println("sample: FAIL");
+    Serial.println("batch: FAIL");
   }
 }
 
@@ -451,10 +465,12 @@ void dispatch(char* line) {
     commandStatus();
   } else if (strcmp(line, "health") == 0) {
     commandHealth();
-  } else if (strcmp(line, "vector") == 0) {
-    commandVector();
-  } else if (strcmp(line, "sample") == 0) {
-    commandSample();
+  } else if (strcmp(line, "ready") == 0) {
+    commandReadiness();
+  } else if (strcmp(line, "payload") == 0) {
+    commandPayload();
+  } else if (strcmp(line, "batch") == 0 || strcmp(line, "sample") == 0) {
+    commandBatch();
   } else {
     Serial.print("unknown command: ");
     Serial.println(line);
@@ -468,7 +484,7 @@ void setup() {
   Serial.begin(115200);
   delay(1500);
   Serial.println();
-  Serial.println("ESP32-S3 WiFi Cloudflare PoC");
+  Serial.println("ESP32-S3 WiFi Cloudflare Batch PoC");
   printHelp();
 }
 

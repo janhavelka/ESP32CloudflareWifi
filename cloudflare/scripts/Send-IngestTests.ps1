@@ -317,7 +317,7 @@ if ($Mode -eq "Sample") {
 }
 
 if ($BaseUrl.Length -eq 0) { $BaseUrl = $DefaultBatchBaseUrl }
-if ($DeviceId.Length -eq 0) { $DeviceId = "tm-001" }
+if ($DeviceId.Length -eq 0) { $DeviceId = "tm-test-mcu-1" }
 if ($Seq -lt 0) { $Seq = 1234 }
 if ($Token.Length -eq 0) {
   throw "Batch mode needs -Token or `$env:TM_DEVICE_TOKEN."
