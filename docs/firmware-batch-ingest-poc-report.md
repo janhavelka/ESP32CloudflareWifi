@@ -1,10 +1,10 @@
-# ESP32 Batch Ingest POC Handoff
+# ESP32 Batch Ingest Worker Handoff
 
 ## Purpose
 
-This repository is currently a proof of concept showing that an ESP32-S3 can connect over WiFi/TLS to the Cloudflare Worker in `docs/worker/worker.md` and successfully send authenticated `tm.batch.v1` data.
+This document summarizes the proven Cloudflare Worker ingest contract for a real ESP32 firmware implementation.
 
-This is not final production firmware. The current code uses generated fake measurements, SNTP time, and simple serial commands. The real firmware should replace those pieces with the existing sensor pipeline, queue/retry storage, and the device RTC module.
+The existing proof of concept only demonstrated that the ESP32 can connect over WiFi/TLS and send authenticated `tm.batch.v1` data successfully. Production firmware should use its own sensor pipeline, persistent queue, retry logic, and RTC module.
 
 ## Worker Target
 
@@ -15,13 +15,12 @@ This is not final production firmware. The current code uses generated fake meas
 - Admin UI: `GET /admin`
 - Admin API: `/api/v1/admin/*`, protected by `X-TM-Admin-Token`
 
-The active Worker accepts batch ingest, not the older sample/HMAC protocol in `cloudflare/src/index.ts`.
+The active Worker accepts batch ingest. It does not use the older single-sample HMAC protocol.
 
 ## Test Device
 
 - Device id: `tm-test-mcu-1`
-- Device token: stored locally in ignored `include/secrets.h` as `CLOUD_DEVICE_TOKEN`
-- Do not put the token into tracked files.
+- Device token: obtain securely from the project owner and do not commit it to firmware source.
 
 Ingest auth uses headers:
 
@@ -70,37 +69,6 @@ pwr: { vin_v, iin_a }, number or null
 
 The Worker expands each sample into measurement rows. Null-only samples currently become empty measurement records in the UI/database, which is expected for this POC but probably not desired for production.
 
-## Current Firmware POC
-
-Main files:
-
-- `src/main.cpp`
-- `include/CloudConfig.h`
-- `include/secrets.h`
-- `include/secrets.example.h`
-
-Serial commands:
-
-```text
-wifi     Connect and print WiFi state
-time     Sync/check SNTP time
-status   WiFi + DNS + time + HTTPS health check
-conn     Alias for status
-health   GET /health
-ready    GET /health/ready
-payload  Print a generated tm.batch.v1 JSON body only
-batch    Generate and POST a new batch
-sample   Alias for batch for compatibility
-```
-
-Important implementation notes:
-
-- TLS uses the ESP-IDF CA bundle through `WiFiClientSecure::setCACertBundle`.
-- Time is currently obtained through SNTP using `pool.ntp.org`, `time.cloudflare.com`, and `time.nist.gov`.
-- `payload` does not cache or send anything.
-- `batch` always generates a fresh batch id and fresh sequence range from current Unix time.
-- The POC sends 2 samples per batch: one full fake measurement sample and one null placeholder sample.
-
 ## Verified Results
 
 PC tests and ESP32 serial tests confirmed:
@@ -127,7 +95,7 @@ That equals 3 batches and 6 sample rows. The `seq_last` rows are empty because t
 
 ## Production Firmware Guidance
 
-Replace the POC batch builder with real firmware integration:
+Implement the real firmware around this contract:
 
 - Use the real RTC module for `created_at` and sample `t`.
 - Use monotonic persistent sequence numbers, not Unix time as sequence.
@@ -142,13 +110,3 @@ Replace the POC batch builder with real firmware integration:
 - Treat HTTP 400 as firmware payload bug or schema mismatch.
 - Treat HTTP 409 as duplicate batch id conflict caused by reusing a batch id with changed contents.
 - Retry transient network/5xx failures without changing the batch body or batch id.
-
-## Build
-
-The firmware builds with:
-
-```powershell
-& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -e tunnelmonitor_s3_wifi_cloud_poc
-```
-
-`pio` may not be on PATH; the full PlatformIO path above worked in this environment.
