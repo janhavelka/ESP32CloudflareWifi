@@ -4,6 +4,7 @@
 #include <WiFiClientSecure.h>
 #include <cstdint>
 #include <cstring>
+#include <esp_heap_caps.h>
 #include <mbedtls/md.h>
 #include <time.h>
 
@@ -37,6 +38,7 @@ static constexpr const char* kFirmwareVersion = "0.1.0";
 static constexpr const char* kHardwareVersion = "esp32-s3-wroom-n16r8";
 static constexpr size_t kSha256DigestBytes = 32;
 static constexpr size_t kSha256HexChars = kSha256DigestBytes * 2;
+static constexpr size_t kBatchBodyCap = 256 * 1024;
 
 const char* wifiStatusName(wl_status_t status) {
   switch (status) {
@@ -257,7 +259,33 @@ bool hmacSha256Hex(const char* secret, const char* data, size_t dataLen,
   return bytesToHex(digest, sizeof(digest), hexOut, hexOutCap);
 }
 
-bool buildIngestAuthHeaders(const char* body, char* timestampOut,
+char* allocateBatchBody(size_t cap) {
+  void* ptr = nullptr;
+
+#if defined(BOARD_HAS_PSRAM)
+  ptr = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (ptr != nullptr) {
+    return static_cast<char*>(ptr);
+  }
+  Serial.println("batch: PSRAM body allocation failed, trying internal heap");
+#endif
+
+  ptr = heap_caps_malloc(cap, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (ptr == nullptr) {
+    Serial.printf("batch: body allocation failed bytes=%u\n",
+                  static_cast<unsigned>(cap));
+    return nullptr;
+  }
+  return static_cast<char*>(ptr);
+}
+
+void freeBatchBody(char* body) {
+  if (body != nullptr) {
+    heap_caps_free(body);
+  }
+}
+
+bool buildIngestAuthHeaders(const char* body, size_t bodyLen, char* timestampOut,
                             size_t timestampOutCap, char* contentSha256Out,
                             size_t contentSha256OutCap, char* signatureOut,
                             size_t signatureOutCap) {
@@ -277,7 +305,7 @@ bool buildIngestAuthHeaders(const char* body, char* timestampOut,
     return false;
   }
 
-  if (!sha256Hex(body, strlen(body), contentSha256Out, contentSha256OutCap)) {
+  if (!sha256Hex(body, bodyLen, contentSha256Out, contentSha256OutCap)) {
     return false;
   }
 
@@ -326,7 +354,8 @@ bool resolveCloudHost(IPAddress& addressOut) {
 }
 
 int httpsRequest(const char* method, const char* url, const char* body,
-                 String* responseOut, bool includeDeviceAuth = false) {
+                 size_t bodyLen, String* responseOut,
+                 bool includeDeviceAuth = false) {
   if (!ensureWifi()) return -1;
   if (!ensureTime()) return -1;
 
@@ -344,12 +373,18 @@ int httpsRequest(const char* method, const char* url, const char* body,
   if (strcmp(method, "GET") == 0) {
     code = http.GET();
   } else {
+    if (body == nullptr || bodyLen == 0) {
+      Serial.println("http: POST body is empty");
+      http.end();
+      return -1;
+    }
+
     http.addHeader("Content-Type", "application/json");
     if (includeDeviceAuth) {
       char timestamp[24];
       char contentSha256[kSha256HexChars + 1];
       char signature[kIngestSignaturePrefixChars + kSha256HexChars + 1];
-      if (!buildIngestAuthHeaders(body, timestamp, sizeof(timestamp),
+      if (!buildIngestAuthHeaders(body, bodyLen, timestamp, sizeof(timestamp),
                                   contentSha256, sizeof(contentSha256),
                                   signature, sizeof(signature))) {
         http.end();
@@ -360,7 +395,8 @@ int httpsRequest(const char* method, const char* url, const char* body,
       http.addHeader("X-TM-Content-SHA256", contentSha256);
       http.addHeader("X-TM-Signature", signature);
     }
-    code = http.POST(String(body));
+    code = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body)),
+                     bodyLen);
   }
 
   if (responseOut != nullptr) {
@@ -401,14 +437,15 @@ void commandTime() {
 
 void commandHealth() {
   String response;
-  const int code = httpsRequest("GET", CLOUD_HEALTH_URL, nullptr, &response);
+  const int code = httpsRequest("GET", CLOUD_HEALTH_URL, nullptr, 0, &response);
   Serial.printf("health: http=%d\n", code);
   Serial.println(response);
 }
 
 void commandReadiness() {
   String response;
-  const int code = httpsRequest("GET", CLOUD_READINESS_URL, nullptr, &response);
+  const int code =
+      httpsRequest("GET", CLOUD_READINESS_URL, nullptr, 0, &response);
   Serial.printf("ready: http=%d\n", code);
   Serial.println(response);
 }
@@ -442,7 +479,7 @@ void commandStatus() {
   }
 
   String response;
-  const int code = httpsRequest("GET", CLOUD_HEALTH_URL, nullptr, &response);
+  const int code = httpsRequest("GET", CLOUD_HEALTH_URL, nullptr, 0, &response);
   const bool cloudOk = code >= 200 && code < 300;
   Serial.printf("cloud: health http=%d\n", code);
   if (response.length() > 0) {
@@ -469,7 +506,7 @@ long long nextSeqFirst() {
 }
 
 bool buildBatch(char* body, size_t bodyCap, char* batchId, size_t batchIdCap,
-                long long* seqLastOut) {
+                size_t* bodyLenOut, long long* seqLastOut) {
   const long long seqFirst = nextSeqFirst();
   const long long seqLast = seqFirst + 1;
   const long long now = static_cast<long long>(time(nullptr));
@@ -524,6 +561,10 @@ bool buildBatch(char* body, size_t bodyCap, char* batchId, size_t batchIdCap,
     return false;
   }
 
+  if (bodyLenOut != nullptr) {
+    *bodyLenOut = static_cast<size_t>(bodyLen);
+  }
+
   if (seqLastOut != nullptr) {
     *seqLastOut = seqLast;
   }
@@ -534,10 +575,15 @@ void commandPayload() {
   if (!ensureWifi()) return;
   if (!ensureTime()) return;
 
-  char body[3072];
+  char* body = allocateBatchBody(kBatchBodyCap);
+  if (body == nullptr) return;
+
   char batchId[96];
+  size_t bodyLen = 0;
   long long seqLast = 0;
-  if (!buildBatch(body, sizeof(body), batchId, sizeof(batchId), &seqLast)) {
+  if (!buildBatch(body, kBatchBodyCap, batchId, sizeof(batchId), &bodyLen,
+                  &seqLast)) {
+    freeBatchBody(body);
     return;
   }
 
@@ -545,21 +591,29 @@ void commandPayload() {
   Serial.println(batchId);
   Serial.printf("accepted_seq_last=%lld\n", seqLast);
   Serial.println(body);
+  freeBatchBody(body);
 }
 
 void commandBatch() {
   if (!ensureWifi()) return;
   if (!ensureTime()) return;
 
-  char body[3072];
+  char* body = allocateBatchBody(kBatchBodyCap);
+  if (body == nullptr) return;
+
   char batchId[96];
+  size_t bodyLen = 0;
   long long seqLast = 0;
-  if (!buildBatch(body, sizeof(body), batchId, sizeof(batchId), &seqLast)) {
+  if (!buildBatch(body, kBatchBodyCap, batchId, sizeof(batchId), &bodyLen,
+                  &seqLast)) {
+    freeBatchBody(body);
     return;
   }
 
   String response;
-  const int code = httpsRequest("POST", CLOUD_INGEST_URL, body, &response, true);
+  const int code =
+      httpsRequest("POST", CLOUD_INGEST_URL, body, bodyLen, &response, true);
+  freeBatchBody(body);
   Serial.printf("batch: http=%d batch_id=%s accepted_seq_last=%lld\n", code,
                 batchId, seqLast);
   Serial.println(response);
