@@ -17,15 +17,38 @@ Required request headers:
 ```http
 Content-Type: application/json
 X-TM-Device: tm-test-mcu-1
-X-TM-Token: <raw device token>
+X-TM-Timestamp: <unix_seconds>
+X-TM-Content-SHA256: <lowercase_sha256_hex_of_raw_body>
+X-TM-Signature: v1=<lowercase_hmac_sha256_hex>
 ```
 
 Notes:
 
 - `X-TM-Device` must match the JSON `device_id`.
-- `X-TM-Token` is the device bearer token. Do not save it per sample and do not write it into logs.
-- The Worker hashes the supplied token and compares it to the stored hash.
-- There is no per-message HMAC in the current batch protocol.
+- `X-TM-Timestamp` is Unix seconds and must be within the Worker's five-minute clock-skew window.
+- `X-TM-Content-SHA256` is SHA-256 over the exact raw UTF-8 JSON body being sent.
+- `X-TM-Signature` is an HMAC-SHA256 signature using the device's registered HMAC secret as UTF-8 key material.
+- The raw HMAC secret is never sent in JSON or HTTP headers and must not be logged.
+
+The signed canonical string is:
+
+```text
+tm-hmac-v1
+POST
+/api/v1/ingest
+<device_id>
+<unix_seconds>
+<lowercase_sha256_hex_of_raw_body>
+```
+
+Do not add a trailing newline. For every send attempt, compute:
+
+```text
+content_sha256 = SHA256(raw_json)
+signature = "v1=" + HMAC_SHA256_HEX(device_hmac_secret, canonical_string)
+```
+
+For a retry, reuse the exact same `raw_json` and recompute `X-TM-Timestamp`, `X-TM-Content-SHA256`, and `X-TM-Signature` from that body. The content hash stays the same if the body is unchanged; the timestamp and signature normally change.
 
 ## Batch Envelope
 
@@ -138,7 +161,7 @@ Critical rule:
 If a batch was sent but not acknowledged, retry the exact same raw_json with the same batch_id.
 ```
 
-Do not rebuild the JSON for a retry. Rebuilding can change timestamps, diagnostics, float formatting, field order, or whitespace. If the `batch_id` stays the same but the body changes, the Worker can reject it as a duplicate conflict.
+Do not rebuild the JSON for a retry. Rebuilding can change timestamps, diagnostics, float formatting, field order, or whitespace. If the `batch_id` stays the same but the body changes, the Worker can reject it as a duplicate conflict. HMAC headers are transport metadata and should be regenerated for each attempt from the stored `raw_json`.
 
 ## Batch Assembly Flow
 
@@ -156,9 +179,9 @@ created_at = current RTC Unix seconds
 
 5. Serialize the full JSON batch.
 6. Save the pending batch record with exact `raw_json`.
-7. POST the saved `raw_json` over HTTPS with auth headers.
+7. POST the saved `raw_json` over HTTPS with fresh HMAC auth headers.
 8. On HTTP 200 `status: accepted`, mark all samples up to `accepted_seq_last` as acknowledged and delete the pending batch.
-9. On network failure or HTTP 5xx, keep the pending batch and retry the same `raw_json`.
+9. On network failure or HTTP 5xx, keep the pending batch and retry the same `raw_json` with a new timestamp/signature.
 10. On HTTP 400, treat as firmware/schema bug.
 11. On HTTP 401/403, treat as credential/device registration error.
 12. On HTTP 409, treat as batch id reused with changed contents.

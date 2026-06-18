@@ -4,6 +4,7 @@
 #include <WiFiClientSecure.h>
 #include <cstdint>
 #include <cstring>
+#include <mbedtls/md.h>
 #include <time.h>
 
 #include "CloudConfig.h"
@@ -28,9 +29,14 @@ static constexpr const char* kNtpServer2 = "time.cloudflare.com";
 static constexpr const char* kNtpServer3 = "time.nist.gov";
 static constexpr const char* kBatchSchema = "tm.batch.v1";
 static constexpr const char* kBatchProfile = "tm.v1.vw8_shzk16_env_power";
+static constexpr const char* kIngestHmacScheme = "tm-hmac-v1";
+static constexpr const char* kIngestSignaturePrefix = "v1=";
+static constexpr size_t kIngestSignaturePrefixChars = 3;
 static constexpr uint32_t kSamplePeriodSeconds = 900;
 static constexpr const char* kFirmwareVersion = "0.1.0";
 static constexpr const char* kHardwareVersion = "esp32-s3-wroom-n16r8";
+static constexpr size_t kSha256DigestBytes = 32;
+static constexpr size_t kSha256HexChars = kSha256DigestBytes * 2;
 
 const char* wifiStatusName(wl_status_t status) {
   switch (status) {
@@ -195,6 +201,115 @@ String compactResponse(String response) {
   return response;
 }
 
+bool bytesToHex(const uint8_t* bytes, size_t len, char* out, size_t outCap) {
+  static constexpr char kHex[] = "0123456789abcdef";
+
+  if (outCap < len * 2 + 1) {
+    return false;
+  }
+
+  for (size_t i = 0; i < len; ++i) {
+    out[i * 2] = kHex[bytes[i] >> 4];
+    out[i * 2 + 1] = kHex[bytes[i] & 0x0F];
+  }
+  out[len * 2] = '\0';
+  return true;
+}
+
+bool sha256Hex(const char* data, size_t dataLen, char* hexOut,
+               size_t hexOutCap) {
+  const mbedtls_md_info_t* mdInfo =
+      mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (mdInfo == nullptr) {
+    Serial.println("crypto: SHA-256 unavailable");
+    return false;
+  }
+
+  uint8_t digest[kSha256DigestBytes];
+  const int rc = mbedtls_md(
+      mdInfo, reinterpret_cast<const unsigned char*>(data), dataLen, digest);
+  if (rc != 0) {
+    Serial.printf("crypto: SHA-256 failed rc=%d\n", rc);
+    return false;
+  }
+
+  return bytesToHex(digest, sizeof(digest), hexOut, hexOutCap);
+}
+
+bool hmacSha256Hex(const char* secret, const char* data, size_t dataLen,
+                   char* hexOut, size_t hexOutCap) {
+  const mbedtls_md_info_t* mdInfo =
+      mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (mdInfo == nullptr) {
+    Serial.println("crypto: SHA-256 unavailable");
+    return false;
+  }
+
+  uint8_t digest[kSha256DigestBytes];
+  const int rc = mbedtls_md_hmac(
+      mdInfo, reinterpret_cast<const unsigned char*>(secret), strlen(secret),
+      reinterpret_cast<const unsigned char*>(data), dataLen, digest);
+  if (rc != 0) {
+    Serial.printf("crypto: HMAC-SHA256 failed rc=%d\n", rc);
+    return false;
+  }
+
+  return bytesToHex(digest, sizeof(digest), hexOut, hexOutCap);
+}
+
+bool buildIngestAuthHeaders(const char* body, char* timestampOut,
+                            size_t timestampOutCap, char* contentSha256Out,
+                            size_t contentSha256OutCap, char* signatureOut,
+                            size_t signatureOutCap) {
+  if (strcmp(CLOUD_DEVICE_HMAC_SECRET, "your-device-hmac-secret") == 0 ||
+      strlen(CLOUD_DEVICE_HMAC_SECRET) == 0) {
+    Serial.println(
+        "cloud: configure CLOUD_DEVICE_HMAC_SECRET in include/secrets.h");
+    return false;
+  }
+
+  const long long timestamp = static_cast<long long>(time(nullptr));
+  const int timestampLen =
+      snprintf(timestampOut, timestampOutCap, "%lld", timestamp);
+  if (timestampLen <= 0 ||
+      static_cast<size_t>(timestampLen) >= timestampOutCap) {
+    Serial.println("cloud: timestamp buffer too small");
+    return false;
+  }
+
+  if (!sha256Hex(body, strlen(body), contentSha256Out, contentSha256OutCap)) {
+    return false;
+  }
+
+  char canonical[320];
+  const int canonicalLen = snprintf(
+      canonical, sizeof(canonical), "%s\nPOST\n%s\n%s\n%s\n%s",
+      kIngestHmacScheme, CLOUD_INGEST_PATH, CLOUD_DEVICE_ID, timestampOut,
+      contentSha256Out);
+  if (canonicalLen <= 0 ||
+      static_cast<size_t>(canonicalLen) >= sizeof(canonical)) {
+    Serial.println("cloud: HMAC canonical string too long");
+    return false;
+  }
+
+  char signatureHex[kSha256HexChars + 1];
+  if (!hmacSha256Hex(CLOUD_DEVICE_HMAC_SECRET, canonical,
+                     static_cast<size_t>(canonicalLen), signatureHex,
+                     sizeof(signatureHex))) {
+    return false;
+  }
+
+  const int signatureLen = snprintf(signatureOut, signatureOutCap, "%s%s",
+                                    kIngestSignaturePrefix, signatureHex);
+  if (signatureLen <= 0 ||
+      static_cast<size_t>(signatureLen) >= signatureOutCap) {
+    Serial.println("cloud: signature buffer too small");
+    return false;
+  }
+
+  return true;
+}
+
 bool resolveCloudHost(IPAddress& addressOut) {
   Serial.print("dns: resolving ");
   Serial.println(CLOUD_HOST);
@@ -231,14 +346,19 @@ int httpsRequest(const char* method, const char* url, const char* body,
   } else {
     http.addHeader("Content-Type", "application/json");
     if (includeDeviceAuth) {
-      if (strcmp(CLOUD_DEVICE_TOKEN, "your-device-token") == 0 ||
-          strlen(CLOUD_DEVICE_TOKEN) == 0) {
-        Serial.println("cloud: configure CLOUD_DEVICE_TOKEN in include/secrets.h");
+      char timestamp[24];
+      char contentSha256[kSha256HexChars + 1];
+      char signature[kIngestSignaturePrefixChars + kSha256HexChars + 1];
+      if (!buildIngestAuthHeaders(body, timestamp, sizeof(timestamp),
+                                  contentSha256, sizeof(contentSha256),
+                                  signature, sizeof(signature))) {
         http.end();
         return -1;
       }
       http.addHeader("X-TM-Device", CLOUD_DEVICE_ID);
-      http.addHeader("X-TM-Token", CLOUD_DEVICE_TOKEN);
+      http.addHeader("X-TM-Timestamp", timestamp);
+      http.addHeader("X-TM-Content-SHA256", contentSha256);
+      http.addHeader("X-TM-Signature", signature);
     }
     code = http.POST(String(body));
   }

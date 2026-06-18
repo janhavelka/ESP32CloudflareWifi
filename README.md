@@ -1,12 +1,12 @@
 # ESP32-S3 WiFi Cloudflare Batch Ingest PoC
 
-Small proof repository for an ESP32-S3-WROOM-N16R8 using Arduino, WiFi station mode, and a USB serial CLI to POST a token-authenticated `tm.batch.v1` payload to a Cloudflare Worker.
+Small proof repository for an ESP32-S3-WROOM-N16R8 using Arduino, WiFi station mode, and a USB serial CLI to POST an HMAC-signed `tm.batch.v1` payload to a Cloudflare Worker.
 
 This intentionally does not include real sensors, SD logging, GSM, display, RS485, or replay logic. The payload uses fixed test measurements and current device time.
 
 ## Firmware
 
-1. Copy the WiFi placeholder file and edit local credentials:
+1. Copy the placeholder secrets file and edit local WiFi credentials plus the device HMAC secret issued by the Worker admin API:
 
    ```bash
    cp include/secrets.example.h include/secrets.h
@@ -33,7 +33,16 @@ This intentionally does not include real sensors, SD logging, GSM, display, RS48
    batch
    ```
 
-`payload` prints the JSON that will be sent. `batch` sends it to the Worker with `X-TM-Device` and `X-TM-Token` headers.
+`payload` prints the JSON that will be sent. `batch` sends it to the Worker with the current HMAC ingest envelope:
+
+```http
+X-TM-Device: tm-test-mcu-1
+X-TM-Timestamp: <unix_seconds>
+X-TM-Content-SHA256: <lowercase_sha256_hex_of_raw_body>
+X-TM-Signature: v1=<lowercase_hmac_sha256_hex>
+```
+
+The signed canonical string is `tm-hmac-v1\nPOST\n/api/v1/ingest\n<device_id>\n<unix_seconds>\n<body_sha256>` with no trailing newline. The HMAC key is `CLOUD_DEVICE_HMAC_SECRET` from `include/secrets.h`; do not put that secret in the JSON body or in any HTTP header.
 
 HTTPS uses the ESP-IDF x509 certificate bundle through Arduino
 `WiFiClientSecure::setCACertBundle(...)`. The device must sync UTC time with
@@ -52,22 +61,10 @@ The firmware targets:
 https://tunnel-monitor.jnhavelka.workers.dev/api/v1/ingest
 ```
 
-The attached bundled Worker in `docs/worker/worker.md` exposes `TunnelMonitor` version `0.6.0`, public health/readiness endpoints, `/api/v1/ingest`, `/admin`, and admin API routes under `/api/v1/admin/*`.
+The current Worker implementation lives in the sibling repository:
 
-The checked-in `cloudflare/src` folder still contains the earlier single-sample HMAC Worker. Use the attached batch Worker, or replace the local Worker source before deploying this newer protocol.
-
-Repeatable PowerShell upload tests from the PC:
-
-```powershell
-$env:TM_DEVICE_TOKEN = "<device token>"
-
-.\cloudflare\scripts\Send-IngestTests.ps1 `
-  -Mode Batch `
-  -BaseUrl "https://tunnel-monitor.jnhavelka.workers.dev" `
-  -DeviceId "tm-test-mcu-1" `
-  -Seq 1234 `
-  -New 1 `
-  -Dupes 1 `
-  -Conflict `
-  -InvalidMissingField
+```text
+C:\Users\Honza\Documents\Projects\TunnelMonitor-Cloudflare
 ```
+
+Its active MCU contract is documented in `docs/ingest-contract-tm-batch-v1.md` in that repository. The important firmware-facing change versus the older proof is that ingest no longer accepts `X-TM-Token`; every POST must be HMAC-signed.
