@@ -33,7 +33,9 @@ This intentionally does not include real sensors, SD logging, GSM, display, RS48
    batch
    ```
 
-`payload` prints the JSON that will be sent. `batch` sends it to the Worker with the current HMAC ingest envelope:
+`payload` builds the current test batch and prints the exact JSON body to the
+serial monitor without sending it. `batch` builds the same kind of body, signs
+it, and sends it to the Worker with the current HMAC ingest envelope:
 
 ```http
 X-TM-Device: tm-test-mcu-1
@@ -43,6 +45,10 @@ X-TM-Signature: v1=<lowercase_hmac_sha256_hex>
 ```
 
 The signed canonical string is `tm-hmac-v1\nPOST\n/api/v1/ingest\n<device_id>\n<unix_seconds>\n<body_sha256>` with no trailing newline. The HMAC key is `CLOUD_DEVICE_HMAC_SECRET` from `include/secrets.h`; do not put that secret in the JSON body or in any HTTP header.
+
+The PoC payload is synthetic and deterministic: it currently contains one full
+fake measurement sample and one all-null placeholder sample. It is for
+connectivity and protocol testing, not real sensor ingestion.
 
 HTTPS uses the ESP-IDF x509 certificate bundle through Arduino
 `WiFiClientSecure::setCACertBundle(...)`. The device must sync UTC time with

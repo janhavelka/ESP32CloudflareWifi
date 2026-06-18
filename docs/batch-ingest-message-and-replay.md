@@ -8,7 +8,14 @@ Data is sent as compact JSON text over HTTPS:
 POST https://tunnel-monitor.jnhavelka.workers.dev/api/v1/ingest
 ```
 
-The device sends one HTTP POST per batch. Each batch contains 1 to 16 samples.
+The device sends one HTTP POST per batch. In the currently checked Worker
+develop branch, each accepted batch contains 1 to 16 samples. If the deployed
+Worker is changed to accept larger batches, treat the Worker runtime constants
+as the source of truth and keep this document in sync.
+
+Send the exact UTF-8 bytes used for `raw_json`. The HTTP `Content-Length` must
+match that byte length. Header order is not significant, but the bytes used for
+the body hash and the bytes written to the socket must be identical.
 
 ## Headers
 
@@ -50,6 +57,10 @@ signature = "v1=" + HMAC_SHA256_HEX(device_hmac_secret, canonical_string)
 
 For a retry, reuse the exact same `raw_json` and recompute `X-TM-Timestamp`, `X-TM-Content-SHA256`, and `X-TM-Signature` from that body. The content hash stays the same if the body is unchanged; the timestamp and signature normally change.
 
+The timestamp must be a positive Unix timestamp in seconds. The Worker rejects
+timestamps outside its configured five-minute clock-skew window, so the device
+must sync RTC/SNTP before ingest.
+
 ## Batch Envelope
 
 Every POST body is one JSON object:
@@ -86,6 +97,10 @@ Important fields:
 | `samples` | Array of sample objects. |
 | `state`, `net`, `queue`, `events` | Diagnostics captured at batch assembly time. |
 
+The HTTP `X-TM-Device` header must match `device_id` exactly. The device id
+must already be registered and active in the Worker database with the same HMAC
+secret used by firmware.
+
 ## Sample Object
 
 Each saved sample should be serializable to this shape:
@@ -116,6 +131,17 @@ Use JSON `null` only for a channel value that was genuinely missing:
 ```
 
 Do not add an all-null placeholder sample unless the backend should preserve that missing sample as an empty record.
+
+The current PoC firmware intentionally sends two synthetic samples:
+
+```text
+sample 1: fixed fake measurements for all supported channels
+sample 2: all measurements null
+```
+
+That is only for end-to-end connectivity testing. Production firmware should
+send real queued samples and should not include the null placeholder unless an
+explicit missing sample row is desired in the backend.
 
 ## Firmware Sample Storage
 
@@ -186,6 +212,37 @@ created_at = current RTC Unix seconds
 11. On HTTP 401/403, treat as credential/device registration error.
 12. On HTTP 409, treat as batch id reused with changed contents.
 
+## Response Handling
+
+A successful ingest response is HTTP 200 with JSON:
+
+```json
+{
+  "status": "accepted",
+  "device_id": "tm-test-mcu-1",
+  "batch_id": "tm-test-mcu-1-1000-1015",
+  "accepted_seq_last": 1015,
+  "cloud_time": 1781360005,
+  "config_revision": 1
+}
+```
+
+The firmware should only mark samples as acknowledged after HTTP 200 and
+`status: "accepted"`. Use `accepted_seq_last` as the durable acknowledgement
+boundary for that device.
+
+Expected failure classes:
+
+| HTTP | Reason | Firmware action |
+|---:|---|---|
+| 400 | `invalid_payload` | Firmware/schema bug; do not retry unchanged forever. |
+| 401 | `unauthorized` | Missing/stale/bad HMAC headers, unknown device, or wrong secret. |
+| 403 | `device_mismatch` | Header device id and JSON `device_id` differ. |
+| 409 | `duplicate_batch_conflict` | Same `batch_id` reused with different body/metadata. |
+| 413 | `payload_too_large` | Batch exceeds current Worker raw body limit. |
+| 415 | `unsupported_media_type` | Missing or wrong `Content-Type`. |
+| 5xx | transient backend/dependency error | Retry the same `raw_json` later with fresh HMAC headers. |
+
 ## Worker Limits
 
 Current Worker limits:
@@ -203,6 +260,35 @@ Max events: 32
 Max events JSON size: 8 KiB
 ```
 
+These are the limits in the Worker develop branch last checked from
+`TunnelMonitor-Cloudflare/src/ingest/limits.ts`. The current ESP32 PoC allocates
+a 256 KiB PSRAM-capable body buffer so the firmware path can tolerate a future
+larger deployed limit, but the backend may still reject bodies above the active
+Worker limit.
+
+## MCU Memory Notes
+
+For larger batches, keep the raw JSON body off the Arduino `loopTask` stack.
+Allocate it in PSRAM or another heap-backed buffer and keep the exact byte
+length alongside the pointer.
+
+Avoid APIs that create a full duplicate body string. On Arduino ESP32, prefer
+the byte-buffer POST shape:
+
+```cpp
+http.POST(reinterpret_cast<uint8_t*>(body), body_len);
+```
+
+Do not send large bodies with:
+
+```cpp
+http.POST(String(body));
+```
+
+The SHA-256 operation can hash the PSRAM body directly. HMAC signs only the
+small canonical string. TLS and WiFi still use internal RAM for their own
+buffers, so leave internal heap headroom even when the raw JSON lives in PSRAM.
+
 ## Message Size Notes
 
 The payload is JSON text, not binary. Numeric firmware values become ASCII/UTF-8 JSON numbers:
@@ -213,7 +299,7 @@ float vin 12.41     -> "vin_v":12.41
 missing value       -> null
 ```
 
-The batch envelope is fixed overhead paid once per request. Adding more samples grows the JSON by only the per-sample object size, so a 16-sample batch is much more efficient than 16 one-sample HTTPS requests.
+The batch envelope is fixed overhead paid once per request. Adding more samples grows the JSON by only the per-sample object size, so a multi-sample batch is much more efficient than one HTTPS request per sample.
 
 Observed POC sizes:
 
