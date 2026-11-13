@@ -74,3 +74,7 @@ C:\Users\Honza\Documents\Projects\TunnelMonitor-Cloudflare
 ```
 
 Its active MCU contract is documented in `docs/ingest-contract-tm-batch-v1.md` in that repository. The important firmware-facing change versus the older proof is that ingest no longer accepts `X-TM-Token`; every POST must be HMAC-signed.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
